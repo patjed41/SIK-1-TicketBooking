@@ -1,3 +1,6 @@
+// Needed to make getline work.
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +16,15 @@
 #define DEFAULT_TIMEOUT 5
 #define MIN_TIMEOUT 1
 #define MAX_TIMEOUT 86400
+
+#define DESCRIPTION_SIZE 80
+#define MIN_NUMBER_OF_TICKETS 0
+#define MAX_NUMBER_OF_TICKETS 65535
+
+typedef struct Event {
+    char description[DESCRIPTION_SIZE + 1];
+    uint16_t tickets;
+} Event;
 
 // Prints [message] and exits program with code 1.
 void fatal(const char *message) {
@@ -48,7 +60,7 @@ void read_timeout(const char *timeout_str, uint32_t *timeout_ptr) {
 }
 
 // Function responsible for reading and checking comand line parameters.
-void read_parameters(int argc, char *argv[], char **file_name_ptr,
+void read_parameters(int argc, char *argv[], char **file_ptr,
                      uint16_t *port_ptr, uint32_t *timeout_ptr) {
     if (argc != 3 && argc != 5 && argc != 7) {
         fatal("Wrong number of command line parameters.");
@@ -60,7 +72,11 @@ void read_parameters(int argc, char *argv[], char **file_name_ptr,
     if (strcmp(argv[2], "-f") == 0) {
         fatal("File name \'-f\' is prohibited.");
     }
-    strcpy(*file_name_ptr, argv[2]);
+
+    if ((*file_ptr = (char *) malloc(strlen(argv[2]) + 1)) == NULL) {
+        fatal("malloc on file_ptr failed.");
+    }
+    strcpy(*file_ptr, argv[2]);
 
     // only port
     if (argc == 5 && strcmp(argv[3], "-p") == 0) {
@@ -81,12 +97,72 @@ void read_parameters(int argc, char *argv[], char **file_name_ptr,
     }
 }
 
+// Function responsible for reading information about events from file.
+// Returns number of events read.
+size_t read_events(const char *file, Event **events) {
+    FILE *events_file = fopen(file, "r");
+    if (events_file == NULL) {
+        fatal("Could not open file.");
+    }
+
+    char *line_buffer = NULL;
+    size_t line_buffer_size = 0;
+    ssize_t line_size = 0;
+    size_t events_read = 0;
+    size_t events_size = 0;
+
+    while ((line_size = getline(&line_buffer, &line_buffer_size, events_file)) != -1) {
+        if (events_read == events_size) {
+            events_size = (events_size + 1) * 2;
+            if ((*events = (Event *) realloc(*events, events_size * sizeof(Event))) == NULL) {
+                fatal("realloc on events failed.");
+            }
+        }
+
+        strcpy((*events)[events_read].description, line_buffer);
+        (*events)[events_read].description[line_size - 1] = '\0';
+
+        if ((line_size = getline(&line_buffer, &line_buffer_size, events_file)) == -1) {
+            break;
+        }
+
+        check_uint(line_buffer, MIN_NUMBER_OF_TICKETS, MAX_NUMBER_OF_TICKETS);
+        (*events)[events_read].tickets = atoi(line_buffer);
+
+        events_read++;
+
+        errno = 0;
+    }
+
+    // Checking if last getline call succeeded.
+    if (errno != 0) {
+        fatal("Getline failed.");
+    }
+
+    if (fclose(events_file) != 0) {
+        fatal("Could not close file.");
+    }
+
+    free(line_buffer);
+
+    return events_read;
+}
+
 int main(int argc, char *argv[]) {
-    char *file_name;
+    char *file;
     uint16_t port = DEFAULT_PORT;
     uint32_t timeout = DEFAULT_TIMEOUT;
 
-    read_parameters(argc, argv, &file_name, &port, &timeout);
+    read_parameters(argc, argv, &file, &port, &timeout);
 
-    printf("%s\n%d\n%d", file_name, port, timeout);
+    Event *events = NULL;
+    size_t number_of_events = read_events(file, &events);
+    for (size_t i = 0; i < number_of_events; i++) {
+        printf("%s\n%d\n\n", events[i].description, events[i].tickets);
+    }
+
+    free(file);
+    free(events);
+
+    return 0;
 }
