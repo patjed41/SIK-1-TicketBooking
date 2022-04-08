@@ -5,9 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdarg.h>
+#include <unistd.h>
 
 #define DEFAULT_PORT 2022
 #define MIN_PORT 0
@@ -21,16 +25,79 @@
 #define MIN_NUMBER_OF_TICKETS 0
 #define MAX_NUMBER_OF_TICKETS 65535
 
+#define OCTET_SIZE 8
+
+#define GET_EVENTS_ID 1
+#define EVENTS_ID 2
+#define GET_RESERVETION_ID 3
+#define RESERVATION_ID 4
+#define GET_TICKETS_ID 5
+#define TICKETS_ID 6
+#define BAD_REQUEST_ID 255
+
+#define DATAGRAM_LIMIT 66507
+
+// Evaluate `x`: if non-zero, describe it as a standard error code and exit with an error.
+#define CHECK(x)                                                          \
+    do {                                                                  \
+        int err = (x);                                                    \
+        if (err != 0) {                                                   \
+            fprintf(stderr, "Error: %s returned %d in %s at %s:%d\n%s\n", \
+                #x, err, __func__, __FILE__, __LINE__, strerror(err));    \
+            exit(EXIT_FAILURE);                                           \
+        }                                                                 \
+    } while (0)
+
+// Evaluate `x`: if false, print an error message and exit with an error.
+#define ENSURE(x)                                                         \
+    do {                                                                  \
+        bool result = (x);                                                \
+        if (!result) {                                                    \
+            fprintf(stderr, "Error: %s was false in %s at %s:%d\n",       \
+                #x, __func__, __FILE__, __LINE__);                        \
+            exit(EXIT_FAILURE);                                           \
+        }                                                                 \
+    } while (0)
+
+// Check if errno is non-zero, and if so, print an error message and exit with an error.
+#define PRINT_ERRNO()                                                  \
+    do {                                                               \
+        if (errno != 0) {                                              \
+            fprintf(stderr, "Error: errno %d in %s at %s:%d\n%s\n",    \
+              errno, __func__, __FILE__, __LINE__, strerror(errno));   \
+            exit(EXIT_FAILURE);                                        \
+        }                                                              \
+    } while (0)
+
+
+// Set `errno` to 0 and evaluate `x`. If `errno` changed, describe it and exit.
+#define CHECK_ERRNO(x)                                                             \
+    do {                                                                           \
+        errno = 0;                                                                 \
+        (void) (x);                                                                \
+        PRINT_ERRNO();                                                             \
+    } while (0)
+
+// Note: the while loop above wraps the statements so that the macro can be used with a semicolon
+// for example: if (a) CHECK(x); else CHECK(y);
+
+// Print an error message and exit with an error.
+void fatal(const char *fmt, ...) {
+    va_list fmt_args;
+
+    fprintf(stderr, "Error: ");
+    va_start(fmt_args, fmt);
+    vfprintf(stderr, fmt, fmt_args);
+    va_end(fmt_args);
+    fprintf(stderr, "\n");
+    exit(EXIT_FAILURE);
+}
+
 typedef struct Event {
-    char description[DESCRIPTION_SIZE + 1];
+    char description[DESCRIPTION_SIZE];
+    uint8_t description_length;
     uint16_t tickets;
 } Event;
-
-// Prints [message] and exits program with code 1.
-void fatal(const char *message) {
-    fprintf(stderr, "%s\n", message);
-    exit(1);
-}
 
 // Checks if value of uint32_t represented by [str] is between [min_value]
 // and [max_value].
@@ -119,8 +186,8 @@ size_t read_events(const char *file, Event **events) {
             }
         }
 
-        strcpy((*events)[events_read].description, line_buffer);
-        (*events)[events_read].description[line_size - 1] = '\0';
+        (*events)[events_read].description_length = line_size - 1;
+        strncpy((*events)[events_read].description, line_buffer, line_size - 1);
 
         if ((line_size = getline(&line_buffer, &line_buffer_size, events_file)) == -1) {
             break;
@@ -148,6 +215,93 @@ size_t read_events(const char *file, Event **events) {
     return events_read;
 }
 
+int bind_socket(uint16_t port) {
+    int socket_fd = socket(AF_INET, SOCK_DGRAM, 0); // creating IPv4 UDP socket
+    ENSURE(socket_fd > 0);
+    // after socket() call; we should close(sock) on any execution path;
+
+    struct sockaddr_in server_address;
+    server_address.sin_family = AF_INET; // IPv4
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY); // listening on all interfaces
+    server_address.sin_port = htons(port);
+
+    // bind the socket to a concrete address
+    CHECK_ERRNO(bind(socket_fd, (struct sockaddr *) &server_address,
+                        (socklen_t) sizeof(server_address)));
+
+    return socket_fd;
+}
+
+size_t read_message(int socket_fd, struct sockaddr_in *client_address, char *buffer, size_t max_length) {
+    socklen_t address_length = (socklen_t) sizeof(*client_address);
+    int flags = 0; // we do not request anything special
+    errno = 0;
+    ssize_t len = recvfrom(socket_fd, buffer, max_length, flags,
+                           (struct sockaddr *) client_address, &address_length);
+    if (len < 0) {
+        PRINT_ERRNO();
+    }
+    return (size_t) len;
+}
+
+void send_message(int socket_fd, const struct sockaddr_in *client_address, const char *message, size_t length) {
+    socklen_t address_length = (socklen_t) sizeof(*client_address);
+    int flags = 0;
+    ssize_t sent_length = sendto(socket_fd, message, length, flags,
+                                 (struct sockaddr *) client_address, address_length);
+    ENSURE(sent_length == (ssize_t) length);
+}
+
+uint8_t get_message_id(const char buffer[], size_t read_length) {
+    if (read_length < 1) {
+        return 0;
+    }
+
+    uint8_t *id_ptr = (uint8_t *) buffer;
+
+    if (*id_ptr != GET_EVENTS_ID && *id_ptr != GET_RESERVETION_ID && *id_ptr != GET_TICKETS_ID) {
+        return 0;
+    }
+
+    return *id_ptr;
+}
+
+void put_into_buffer(char buffer[], void *source, size_t size, size_t *next_byte_ptr) {
+    memcpy(buffer + *next_byte_ptr, source, size);
+    *next_byte_ptr += size;
+}
+
+void put_message_id_into_buffer(char buffer[], uint8_t message_id) {
+    memcpy(buffer, &message_id, 1);
+}
+
+// Returns length.
+size_t build_events_message(char buffer[], Event *events, size_t number_of_events) {
+    uint32_t next_event = 0;
+    size_t next_byte = 1;
+    size_t next_event_size = 0;
+
+    put_message_id_into_buffer(buffer, EVENTS_ID);
+    
+    while (next_event < number_of_events) {
+        next_event_size = 7 + events[next_event].description_length;
+        if (next_event_size + next_byte > DATAGRAM_LIMIT) {
+            break;
+        }
+
+        uint32_t net_order_next_event = htonl(next_event);
+        uint16_t net_order_tickets = htons(events[next_event].tickets);
+        put_into_buffer(buffer, &net_order_next_event, 4, &next_byte);
+        put_into_buffer(buffer, &net_order_tickets, 2, &next_byte);
+        put_into_buffer(buffer, &events[next_event].description_length, 1, &next_byte);
+        put_into_buffer(buffer, events[next_event].description, events[next_event].description_length, &next_byte);
+
+        next_event++;
+    }
+
+    return next_byte;
+}
+
 int main(int argc, char *argv[]) {
     char *file;
     uint16_t port = DEFAULT_PORT;
@@ -157,9 +311,37 @@ int main(int argc, char *argv[]) {
 
     Event *events = NULL;
     size_t number_of_events = read_events(file, &events);
-    for (size_t i = 0; i < number_of_events; i++) {
-        printf("%s\n%d\n\n", events[i].description, events[i].tickets);
+
+    char buffer[DATAGRAM_LIMIT];
+    memset(buffer, 0, sizeof(buffer));
+
+    int socket_fd = bind_socket(port);
+
+    struct sockaddr_in client_address;
+    size_t read_length;
+    for (;;) {
+        read_length = read_message(socket_fd, &client_address, buffer, sizeof(buffer));
+        uint8_t message_id = get_message_id(buffer, read_length);
+
+        switch (message_id) {
+            case GET_EVENTS_ID:
+                if (read_length == 1) {
+                    int send_length = build_events_message(buffer, events, number_of_events);
+                    send_message(socket_fd, &client_address, buffer, send_length); 
+                }
+                break;
+            case GET_RESERVETION_ID:
+
+                break;
+            case GET_TICKETS_ID:
+
+                break;
+        }
+
+        //send_message(socket_fd, &client_address, buffer, read_length);
     }
+
+    CHECK_ERRNO(close(socket_fd));
 
     free(file);
     free(events);
