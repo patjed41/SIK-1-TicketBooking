@@ -6,12 +6,14 @@
 #include <string.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
+#include <endian.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <time.h>
 
 #define DEFAULT_PORT 2022
 #define MIN_PORT 0
@@ -36,6 +38,13 @@
 #define BAD_REQUEST_ID 255
 
 #define DATAGRAM_LIMIT 66507
+
+#define RESERVATION_OFFSET 1000000
+
+#define TICKET_SIZE 7
+#define TICKETS_LIMIT 9500 // (DATAGRAM_LIMIT - 7) / TICKET_SIZE
+
+#define COOKIE_SIZE 48
 
 // Evaluate `x`: if non-zero, describe it as a standard error code and exit with an error.
 #define CHECK(x)                                                          \
@@ -98,6 +107,23 @@ typedef struct Event {
     uint8_t description_length;
     uint16_t tickets;
 } Event;
+
+struct __attribute__((__packed__)) ReservationRequest {
+    uint32_t event_id;
+    uint16_t ticket_count;
+};
+
+typedef struct ReservationRequest ReservationRequest;
+
+struct __attribute__((__packed__)) Reservation {
+    uint32_t reservation_id;
+    uint32_t event_id;
+    uint16_t ticket_count;
+    char cookie[COOKIE_SIZE];
+    time_t expiration_time;
+};
+
+typedef struct Reservation Reservation;
 
 // Checks if value of uint32_t represented by [str] is between [min_value]
 // and [max_value].
@@ -302,6 +328,70 @@ size_t build_events_message(char buffer[], Event *events, size_t number_of_event
     return next_byte;
 }
 
+void get_reservetion_request(const char buffer[], ReservationRequest *request) {
+    memcpy(request, buffer, sizeof(ReservationRequest));
+    request->event_id = ntohl(request->event_id);
+    request->ticket_count = ntohs(request->ticket_count);
+}
+
+bool is_reservation_possible(const ReservationRequest *request, Event *events, size_t number_of_events) {
+    if (request->event_id >= number_of_events || request->ticket_count == 0 ||
+        request->ticket_count > TICKETS_LIMIT) {
+        return false;
+    }
+
+    return events[request->event_id].tickets >= request->ticket_count;
+}
+
+void create_reservation(const ReservationRequest *request, Reservation **reservations, bool **realized_reservations,
+                        size_t *number_of_reservations, size_t *reservations_size, uint32_t timeout) {
+    if (*number_of_reservations == *reservations_size) {
+        *reservations_size = (*reservations_size + 1) * 2;
+        if ((*reservations = (Reservation *) realloc(*reservations, *reservations_size * sizeof(Reservation))) == NULL) {
+            fatal("realloc on reservations failed.");
+        }
+        if ((*realized_reservations = (bool *) realloc(*realized_reservations, *reservations_size * sizeof(bool))) == NULL) {
+            fatal("realloc on reservations failed.");
+        }
+    }
+
+    (*reservations)[*number_of_reservations].reservation_id = htonl(*number_of_reservations + RESERVATION_OFFSET);
+    (*reservations)[*number_of_reservations].event_id = htonl(request->event_id);
+    (*reservations)[*number_of_reservations].ticket_count = htons(request->ticket_count);
+    for (size_t i = 0; i < COOKIE_SIZE; i++) {
+        (*reservations)[*number_of_reservations].cookie[i] = 'a';
+    }
+    (*reservations)[*number_of_reservations].expiration_time = htobe64(time(NULL) + (time_t) timeout);
+
+    (*realized_reservations)[*number_of_reservations] = false;
+    (*number_of_reservations)++;
+}
+
+void build_reservation_message(char buffer[], Reservation *reservations, size_t number_of_reservations) {
+    put_message_id_into_buffer(buffer, RESERVATION_ID);
+
+    memcpy(buffer + 1, reservations + (number_of_reservations - 1), sizeof(Reservation));
+}
+
+void update_reservations(Reservation *reservations, bool *realized_reservations, size_t number_of_reservations,
+                         size_t *next_reservation_to_update, Event *events) {
+    while (*next_reservation_to_update < number_of_reservations &&
+           time(NULL) > (time_t) be64toh(reservations[*next_reservation_to_update].expiration_time)) {
+        if (!realized_reservations[*next_reservation_to_update]) {
+            events[ntohl(reservations[*next_reservation_to_update].event_id)].tickets += ntohs(reservations[*next_reservation_to_update].ticket_count);
+        }
+
+        (*next_reservation_to_update)++;
+    }
+}
+
+void build_bad_request_message(char buffer[], uint32_t id) {
+    put_message_id_into_buffer(buffer, BAD_REQUEST_ID);
+
+    uint32_t net_order_id = htonl(id);
+    memcpy(buffer + 1, &net_order_id, sizeof(uint32_t));
+}
+
 int main(int argc, char *argv[]) {
     char *file;
     uint16_t port = DEFAULT_PORT;
@@ -312,6 +402,12 @@ int main(int argc, char *argv[]) {
     Event *events = NULL;
     size_t number_of_events = read_events(file, &events);
 
+    Reservation *reservations = NULL;
+    bool *realized_reservations = NULL;
+    size_t number_of_reservations = 0;
+    size_t reservations_size = 0;
+    size_t next_reservation_to_update = 0;
+
     char buffer[DATAGRAM_LIMIT];
     memset(buffer, 0, sizeof(buffer));
 
@@ -320,31 +416,47 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in client_address;
     size_t read_length;
     for (;;) {
+        update_reservations(reservations, realized_reservations, number_of_reservations,
+                            &next_reservation_to_update, events);
+
         read_length = read_message(socket_fd, &client_address, buffer, sizeof(buffer));
         uint8_t message_id = get_message_id(buffer, read_length);
 
         switch (message_id) {
             case GET_EVENTS_ID:
                 if (read_length == 1) {
-                    int send_length = build_events_message(buffer, events, number_of_events);
-                    send_message(socket_fd, &client_address, buffer, send_length); 
+                    size_t send_length = build_events_message(buffer, events, number_of_events);
+                    send_message(socket_fd, &client_address, buffer, send_length);
                 }
                 break;
             case GET_RESERVETION_ID:
-
+                if (read_length == sizeof(ReservationRequest) + 1) {
+                    ReservationRequest request;
+                    get_reservetion_request(buffer + 1, &request);
+                    if (is_reservation_possible(&request, events, number_of_events)) {
+                        create_reservation(&request, &reservations, &realized_reservations, &number_of_reservations, &reservations_size, timeout);
+                        events[request.event_id].tickets -= request.ticket_count;
+                        build_reservation_message(buffer, reservations, number_of_reservations);
+                        send_message(socket_fd, &client_address, buffer, sizeof(Reservation) + 1);
+                    }
+                    else {
+                        build_bad_request_message(buffer, request.event_id);
+                        send_message(socket_fd, &client_address, buffer, sizeof(uint32_t) + 1);
+                    }
+                }
                 break;
             case GET_TICKETS_ID:
 
                 break;
         }
-
-        //send_message(socket_fd, &client_address, buffer, read_length);
     }
 
     CHECK_ERRNO(close(socket_fd));
 
     free(file);
     free(events);
+    free(reservations);
+    free(realized_reservations);
 
     return 0;
 }
