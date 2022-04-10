@@ -37,12 +37,12 @@
 #define TICKETS_ID 6
 #define BAD_REQUEST_ID 255
 
-#define DATAGRAM_LIMIT 66507
+#define DATAGRAM_LIMIT 65507
 
 #define RESERVATION_OFFSET 1000000
 
 #define TICKET_SIZE 7
-#define TICKETS_LIMIT 9500 // (DATAGRAM_LIMIT - 7) / TICKET_SIZE
+#define TICKETS_LIMIT 9357 // (DATAGRAM_LIMIT - 7) / TICKET_SIZE
 #define TICKET_ID_BASE 36
 #define MIN_TICKET_ID 1
 #define MAX_TICKET_ID 78364164095 // TICKET_ID_BASE^TICKET_SIZE - 1
@@ -148,6 +148,17 @@ bool check_uint(const char *str, uint32_t min_value, uint32_t max_value) {
     return *end_ptr == '\0' && errno == 0 && value >= min_value && value <= max_value;
 }
 
+void read_file_name(const char *file_str, char **file_ptr) {
+    if (strcmp(file_str, "-f") == 0) {
+        fatal("Illegal file name \'-f\'.");
+    }
+
+    if ((*file_ptr = (char *) malloc(strlen(file_str) + 1)) == NULL) {
+        fatal("malloc on file_ptr failed.");
+    }
+    strcpy(*file_ptr, file_str);
+}
+
 void read_port(const char *port_str, uint16_t *port_ptr) {
     if (!check_uint(port_str, MIN_PORT, MAX_PORT)) {
         fatal("Incorrect port.");
@@ -167,38 +178,23 @@ void read_timeout(const char *timeout_str, uint32_t *timeout_ptr) {
 // Function responsible for reading and checking comand line parameters.
 void read_parameters(int argc, char *argv[], char **file_ptr,
                      uint16_t *port_ptr, uint32_t *timeout_ptr) {
-    if (argc != 3 && argc != 5 && argc != 7) {
+    if (argc % 2 == 0) {
         fatal("Wrong number of command line parameters.");
     }
 
-    if (strcmp(argv[1], "-f") != 0) {
-        fatal("First parameter should be \'-f\'.");
-    }
-    if (strcmp(argv[2], "-f") == 0) {
-        fatal("File name \'-f\' is prohibited.");
-    }
-
-    if ((*file_ptr = (char *) malloc(strlen(argv[2]) + 1)) == NULL) {
-        fatal("malloc on file_ptr failed.");
-    }
-    strcpy(*file_ptr, argv[2]);
-
-    // only port
-    if (argc == 5 && strcmp(argv[3], "-p") == 0) {
-        read_port(argv[4], port_ptr);
-    }
-    // only timeout
-    else if (argc == 5 && strcmp(argv[3], "-t") == 0) {
-        read_timeout(argv[4], timeout_ptr);
-    }
-    // port and timout
-    else if (argc == 7 && strcmp(argv[3], "-p") == 0 && strcmp(argv[5], "-t") == 0) {
-        read_port(argv[4], port_ptr);
-        read_timeout(argv[6], timeout_ptr);
-    }
-    // second or third parameter is incorrect
-    else if (argc > 3) {
-        fatal("Second or third parameter is incorrect.");
+    for (int i = 1; i < argc; i += 2) {
+        if (strcmp(argv[i], "-f") == 0) {
+            read_file_name(argv[i + 1], file_ptr);
+        }
+        else if (strcmp(argv[i], "-p") == 0) {
+            read_port(argv[i + 1], port_ptr);
+        }
+        else if (strcmp(argv[i], "-t") == 0) {
+            read_timeout(argv[i + 1], timeout_ptr);
+        }
+        else {
+            fatal("Illegal parameter ", argv[i], ".");
+        }
     }
 }
 
@@ -506,11 +502,11 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in client_address;
     size_t read_length;
     for (;;) {
-        update_reservations(reservations, first_tickets, number_of_reservations,
-                            &next_reservation_to_update, events);
-
         read_length = read_message(socket_fd, &client_address, buffer, sizeof(buffer));
         uint8_t message_id = get_message_id(buffer, read_length);
+
+        update_reservations(reservations, first_tickets, number_of_reservations,
+                            &next_reservation_to_update, events);
 
         switch (message_id) {
             case GET_EVENTS_ID:
