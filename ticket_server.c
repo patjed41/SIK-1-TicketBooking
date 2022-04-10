@@ -43,8 +43,13 @@
 
 #define TICKET_SIZE 7
 #define TICKETS_LIMIT 9500 // (DATAGRAM_LIMIT - 7) / TICKET_SIZE
+#define TICKET_ID_BASE 36
+#define MIN_TICKET_ID 1
+#define MAX_TICKET_ID 78364164095 // TICKET_ID_BASE^TICKET_SIZE - 1
 
 #define COOKIE_SIZE 48
+#define MIN_COOKIE_CHAR 33
+#define MAX_COOKIE_CHAR 126
 
 // Evaluate `x`: if non-zero, describe it as a standard error code and exit with an error.
 #define CHECK(x)                                                          \
@@ -124,6 +129,13 @@ struct __attribute__((__packed__)) Reservation {
 };
 
 typedef struct Reservation Reservation;
+
+struct __attribute__((__packed__)) TicketsRequest {
+    uint32_t reservation_id;
+    char cookie[COOKIE_SIZE];
+};
+
+typedef struct TicketsRequest TicketsRequest;
 
 // Checks if value of uint32_t represented by [str] is between [min_value]
 // and [max_value].
@@ -292,7 +304,7 @@ uint8_t get_message_id(const char buffer[], size_t read_length) {
     return *id_ptr;
 }
 
-void put_into_buffer(char buffer[], void *source, size_t size, size_t *next_byte_ptr) {
+void put_into_buffer(char buffer[], const void *source, size_t size, size_t *next_byte_ptr) {
     memcpy(buffer + *next_byte_ptr, source, size);
     *next_byte_ptr += size;
 }
@@ -334,23 +346,42 @@ void get_reservetion_request(const char buffer[], ReservationRequest *request) {
     request->ticket_count = ntohs(request->ticket_count);
 }
 
-bool is_reservation_possible(const ReservationRequest *request, Event *events, size_t number_of_events) {
-    if (request->event_id >= number_of_events || request->ticket_count == 0 ||
-        request->ticket_count > TICKETS_LIMIT) {
-        return false;
-    }
-
-    return events[request->event_id].tickets >= request->ticket_count;
+bool is_reservation_possible(const ReservationRequest *request, const Event *events, size_t number_of_events) {
+    return request->event_id < number_of_events &&
+           request->ticket_count > 0 &&
+           request->ticket_count <= TICKETS_LIMIT &&
+           events[request->event_id].tickets >= request->ticket_count;
 }
 
-void create_reservation(const ReservationRequest *request, Reservation **reservations, bool **realized_reservations,
+char random_char(char min_char, char max_char) {
+    return rand() % (max_char - min_char + 1) + min_char;
+}
+
+void fill_cookie(uint32_t reservation_id, char cookie[]) {
+    static const char MID_COOKIE_CHAR = (MAX_COOKIE_CHAR + MIN_COOKIE_CHAR) / 2;
+
+    for (size_t i = 0; i < sizeof(uint32_t) * OCTET_SIZE; i++) {
+        if (reservation_id & (1 << i)) {
+            cookie[i] = random_char(MIN_COOKIE_CHAR, MID_COOKIE_CHAR);
+        }
+        else {
+            cookie[i] = random_char(MID_COOKIE_CHAR + 1, MAX_COOKIE_CHAR);
+        }
+    }
+
+    for (size_t i = sizeof(uint32_t) * OCTET_SIZE; i < COOKIE_SIZE; i++) {
+        cookie[i] = random_char(MID_COOKIE_CHAR, MAX_COOKIE_CHAR);
+    }
+}
+
+void create_reservation(const ReservationRequest *request, Reservation **reservations, uint64_t **first_tickets,
                         size_t *number_of_reservations, size_t *reservations_size, uint32_t timeout) {
     if (*number_of_reservations == *reservations_size) {
         *reservations_size = (*reservations_size + 1) * 2;
         if ((*reservations = (Reservation *) realloc(*reservations, *reservations_size * sizeof(Reservation))) == NULL) {
             fatal("realloc on reservations failed.");
         }
-        if ((*realized_reservations = (bool *) realloc(*realized_reservations, *reservations_size * sizeof(bool))) == NULL) {
+        if ((*first_tickets = (uint64_t *) realloc(*first_tickets, *reservations_size * sizeof(uint64_t))) == NULL) {
             fatal("realloc on reservations failed.");
         }
     }
@@ -358,12 +389,10 @@ void create_reservation(const ReservationRequest *request, Reservation **reserva
     (*reservations)[*number_of_reservations].reservation_id = htonl(*number_of_reservations + RESERVATION_OFFSET);
     (*reservations)[*number_of_reservations].event_id = htonl(request->event_id);
     (*reservations)[*number_of_reservations].ticket_count = htons(request->ticket_count);
-    for (size_t i = 0; i < COOKIE_SIZE; i++) {
-        (*reservations)[*number_of_reservations].cookie[i] = 'a';
-    }
+    fill_cookie((*reservations)[*number_of_reservations].reservation_id, (*reservations)[*number_of_reservations].cookie);
     (*reservations)[*number_of_reservations].expiration_time = htobe64(time(NULL) + (time_t) timeout);
 
-    (*realized_reservations)[*number_of_reservations] = false;
+    (*first_tickets)[*number_of_reservations] = 0;
     (*number_of_reservations)++;
 }
 
@@ -373,16 +402,76 @@ void build_reservation_message(char buffer[], Reservation *reservations, size_t 
     memcpy(buffer + 1, reservations + (number_of_reservations - 1), sizeof(Reservation));
 }
 
-void update_reservations(Reservation *reservations, bool *realized_reservations, size_t number_of_reservations,
+void update_reservations(const Reservation *reservations, const uint64_t *first_tickets, size_t number_of_reservations,
                          size_t *next_reservation_to_update, Event *events) {
     while (*next_reservation_to_update < number_of_reservations &&
            time(NULL) > (time_t) be64toh(reservations[*next_reservation_to_update].expiration_time)) {
-        if (!realized_reservations[*next_reservation_to_update]) {
+        if (first_tickets[*next_reservation_to_update] == 0) {
             events[ntohl(reservations[*next_reservation_to_update].event_id)].tickets += ntohs(reservations[*next_reservation_to_update].ticket_count);
         }
 
         (*next_reservation_to_update)++;
     }
+}
+
+void get_tickets_request(const char buffer[], TicketsRequest *request) {
+    memcpy(request, buffer, sizeof(TicketsRequest));
+    request->reservation_id = ntohl(request->reservation_id);
+}
+
+bool is_sending_tickets_possible(const TicketsRequest *request, const Reservation *reservations,
+                                 const uint64_t *first_tickets, size_t number_of_reservations) {
+    size_t reservation_index = request->reservation_id - RESERVATION_OFFSET;
+
+    return request->reservation_id >= RESERVATION_OFFSET &&
+           reservation_index < number_of_reservations &&
+           strcmp(reservations[reservation_index].cookie, request->cookie) == 0 &&
+           ((time_t) be64toh(reservations[reservation_index].expiration_time) >= time(NULL) ||
+            first_tickets[reservation_index] != 0);
+}
+
+// [value] should be less than 36
+char get_symbol_in_base36(uint64_t value) {
+    ENSURE(value < TICKET_ID_BASE);
+    if (value < 10) {
+        return '0' + value;
+    }
+    else {
+        return 'A' + value - 10;
+    }
+}
+
+// [buffer] size shuld be at least equal to TICKET_SIZE
+void ticket_to_base36(char buffer[], uint64_t ticket_id) {
+    ENSURE(ticket_id < MAX_TICKET_ID);
+    memset(buffer, '0', TICKET_SIZE);
+
+    size_t next_letter = 0;
+    while (ticket_id > 0) {
+        buffer[next_letter] = get_symbol_in_base36(ticket_id % TICKET_ID_BASE);
+        ticket_id /= TICKET_ID_BASE;
+        next_letter++;
+    }
+}
+
+// Returns length.
+size_t build_tickets_message(char buffer[], const TicketsRequest *request,
+                             const Reservation *reservations, uint64_t first_ticket) {
+    put_message_id_into_buffer(buffer, TICKETS_ID);
+
+    size_t next_byte = 1;
+    const Reservation *reservation = reservations + (request->reservation_id - RESERVATION_OFFSET);
+
+    put_into_buffer(buffer, &(reservation->reservation_id), sizeof(uint32_t), &next_byte);
+    put_into_buffer(buffer, &(reservation->ticket_count), sizeof(uint16_t), &next_byte);
+
+    char ticket_buffer[TICKET_SIZE];
+    for (size_t i = 0; i < ntohs(reservation->ticket_count); i++) {
+        ticket_to_base36(ticket_buffer, first_ticket++);
+        put_into_buffer(buffer, ticket_buffer, TICKET_SIZE, &next_byte);
+    }
+
+    return next_byte;
 }
 
 void build_bad_request_message(char buffer[], uint32_t id) {
@@ -403,10 +492,11 @@ int main(int argc, char *argv[]) {
     size_t number_of_events = read_events(file, &events);
 
     Reservation *reservations = NULL;
-    bool *realized_reservations = NULL;
     size_t number_of_reservations = 0;
     size_t reservations_size = 0;
     size_t next_reservation_to_update = 0;
+    uint64_t *first_tickets = NULL;
+    uint64_t next_ticket = MIN_TICKET_ID;
 
     char buffer[DATAGRAM_LIMIT];
     memset(buffer, 0, sizeof(buffer));
@@ -416,7 +506,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in client_address;
     size_t read_length;
     for (;;) {
-        update_reservations(reservations, realized_reservations, number_of_reservations,
+        update_reservations(reservations, first_tickets, number_of_reservations,
                             &next_reservation_to_update, events);
 
         read_length = read_message(socket_fd, &client_address, buffer, sizeof(buffer));
@@ -434,7 +524,7 @@ int main(int argc, char *argv[]) {
                     ReservationRequest request;
                     get_reservetion_request(buffer + 1, &request);
                     if (is_reservation_possible(&request, events, number_of_events)) {
-                        create_reservation(&request, &reservations, &realized_reservations, &number_of_reservations, &reservations_size, timeout);
+                        create_reservation(&request, &reservations, &first_tickets, &number_of_reservations, &reservations_size, timeout);
                         events[request.event_id].tickets -= request.ticket_count;
                         build_reservation_message(buffer, reservations, number_of_reservations);
                         send_message(socket_fd, &client_address, buffer, sizeof(Reservation) + 1);
@@ -446,7 +536,24 @@ int main(int argc, char *argv[]) {
                 }
                 break;
             case GET_TICKETS_ID:
-
+                if (read_length == sizeof(TicketsRequest) + 1) {
+                    TicketsRequest request;
+                    get_tickets_request(buffer + 1, &request);
+                    if (is_sending_tickets_possible(&request, reservations, first_tickets, number_of_reservations)) {
+                        size_t reservation_index = request.reservation_id - RESERVATION_OFFSET;
+                        if (first_tickets[reservation_index] == 0) {
+                            first_tickets[reservation_index] = next_ticket;
+                            next_ticket += ntohs(reservations[reservation_index].ticket_count);
+                        }
+                        size_t send_length = build_tickets_message(buffer, &request,
+                            reservations, first_tickets[reservation_index]);
+                        send_message(socket_fd, &client_address, buffer, send_length);
+                    }
+                    else {
+                        build_bad_request_message(buffer, request.reservation_id);
+                        send_message(socket_fd, &client_address, buffer, sizeof(uint32_t) + 1);
+                    }
+                }
                 break;
         }
     }
@@ -456,7 +563,7 @@ int main(int argc, char *argv[]) {
     free(file);
     free(events);
     free(reservations);
-    free(realized_reservations);
+    free(first_tickets);
 
     return 0;
 }
