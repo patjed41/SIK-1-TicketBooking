@@ -549,6 +549,8 @@ size_t build_tickets_message(char *buffer, const TicketsRequest *request,
     return next_byte;
 }
 
+/******************************** BAD REQUEST *********************************/
+
 // Builds BAD_REQUEST message and puts it into [buffer].
 void build_bad_request_message(char *buffer, uint32_t id) {
     put_message_id_into_buffer(buffer, BAD_REQUEST_ID);
@@ -556,6 +558,8 @@ void build_bad_request_message(char *buffer, uint32_t id) {
     uint32_t net_order_id = htonl(id);
     memcpy(buffer + 1, &net_order_id, sizeof(uint32_t));
 }
+
+/************************************ MAIN ************************************/
 
 int main(int argc, char *argv[]) {
     char *file = NULL;
