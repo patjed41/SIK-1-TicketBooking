@@ -486,7 +486,8 @@ void update_reservations(const Reservation *reservations, const uint64_t *first_
     while (*next_reservation_to_update < number_of_reservations &&
            time(NULL) > (time_t) be64toh(reservations[*next_reservation_to_update].expiration_time)) {
         if (first_tickets[*next_reservation_to_update] == 0) {
-            events[ntohl(reservations[*next_reservation_to_update].event_id)].tickets += ntohs(reservations[*next_reservation_to_update].ticket_count);
+            events[ntohl(reservations[*next_reservation_to_update].event_id)].tickets
+                += ntohs(reservations[*next_reservation_to_update].ticket_count);
         }
 
         (*next_reservation_to_update)++;
@@ -607,7 +608,8 @@ int main(int argc, char *argv[]) {
                     get_reservetion_request(buffer + 1, &request);
 
                     if (is_reservation_possible(&request, events, number_of_events)) {
-                        create_reservation(&request, &reservations, &first_tickets, &number_of_reservations, &reservations_size, timeout);
+                        create_reservation(&request, &reservations, &first_tickets,
+                                           &number_of_reservations, &reservations_size, timeout);
                         events[request.event_id].tickets -= request.ticket_count;
 
                         build_reservation_message(buffer, reservations, number_of_reservations);
