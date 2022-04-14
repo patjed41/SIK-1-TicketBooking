@@ -368,32 +368,59 @@ char get_symbol_in_base36(uint64_t value) {
 
 /*************************** GET_EVENTS AND EVENTS ****************************/
 
+// Finds events that will be sent in every EVENT message. It is guaranteed that
+// no more events would fit in the message.
+size_t find_events_in_message(const Event *events, size_t number_of_events,
+                              uint32_t **events_in_message) {
+    size_t next_event_size;
+    size_t sum_of_event_sizes = 0;
+    size_t number_of_events_in_message = 0;
+    size_t events_in_message_size = 0;
+
+    for (size_t event_id = 0; event_id < number_of_events; event_id++) {
+        next_event_size = sizeof(uint8_t)      // size of description_length
+                          + sizeof(uint16_t)   // size of tickets
+                          + sizeof(uint32_t)   // size of event_id
+                          + events[event_id].description_length;
+
+        // Message cannot be longer than DATAGRAM_LIMIT and 1 octet is already
+        // reserved for message id.
+        if (sum_of_event_sizes + next_event_size < DATAGRAM_LIMIT) {
+            // If array [*events_in_message] is full, it must be resized.
+            if (number_of_events_in_message == events_in_message_size) {
+                events_in_message_size = (events_in_message_size + 1) * 2;
+                *events_in_message = (uint32_t *) realloc(*events_in_message,
+                    events_in_message_size * sizeof(uint32_t));
+                ENSURE(*events_in_message != NULL);
+            }
+
+            sum_of_event_sizes += next_event_size;
+            (*events_in_message)[number_of_events_in_message] = event_id;
+            number_of_events_in_message++;
+        }
+    }
+
+    return number_of_events_in_message;
+}
+
 // Builds EVENTS message and puts it into [buffer]. Returns size of the message.
-size_t build_events_message(char *buffer, Event *events, size_t number_of_events) {
+size_t build_events_message(char *buffer, const Event *events,
+                            const uint32_t *events_in_message,
+                            size_t number_of_events_in_message) {
     put_message_id_into_buffer(buffer, EVENTS_ID);
 
-    uint32_t next_event = 0;
     size_t next_byte = 1;
-    size_t next_event_size = 0;
     
-    while (next_event < number_of_events) {
-        next_event_size = sizeof(Event)
-                          + sizeof(uint32_t)   // size of event_id
-                          + events[next_event].description_length;
+    for (size_t i = 0; i < number_of_events_in_message; i++) {
+        uint32_t event_id = events_in_message[i];
 
-        // Message cannot be longer than DATAGRAM_LIMIT.
-        if (next_event_size + next_byte > DATAGRAM_LIMIT) {
-            break;
-        }
+        uint32_t net_order_event_id = htonl(event_id);
+        uint16_t net_order_tickets = htons(events[event_id].tickets);
 
-        uint32_t net_order_next_event = htonl(next_event);
-        uint16_t net_order_tickets = htons(events[next_event].tickets);
-        put_into_buffer(buffer, &net_order_next_event, sizeof(uint32_t), &next_byte);
+        put_into_buffer(buffer, &net_order_event_id, sizeof(uint32_t), &next_byte);
         put_into_buffer(buffer, &net_order_tickets, sizeof(uint16_t), &next_byte);
-        put_into_buffer(buffer, &events[next_event].description_length, sizeof(uint8_t), &next_byte);
-        put_into_buffer(buffer, events[next_event].description, events[next_event].description_length, &next_byte);
-
-        next_event++;
+        put_into_buffer(buffer, &events[event_id].description_length, sizeof(uint8_t), &next_byte);
+        put_into_buffer(buffer, events[event_id].description, events[event_id].description_length, &next_byte);
     }
 
     return next_byte;
@@ -452,7 +479,7 @@ bool same_cookies(const char* cookie1, const char* cookie2) {
 void create_reservation(const ReservationRequest *request, Reservation **reservations,
                         uint64_t **first_tickets, size_t *number_of_reservations,
                         size_t *reservations_size, uint32_t timeout) {
-    // If arrays [reservations] and [first_tickets] are full, they must be resized.
+    // If arrays [*reservations] and [*first_tickets] are full, they must be resized.
     if (*number_of_reservations == *reservations_size) {
         *reservations_size = (*reservations_size + 1) * 2;
         *reservations = (Reservation *) realloc(*reservations, *reservations_size * sizeof(Reservation));
@@ -571,6 +598,10 @@ int main(int argc, char *argv[]) {
     Event *events = NULL;
     size_t number_of_events = read_events(file, &events);
 
+    uint32_t *events_in_message = NULL; // indexes of events in EVENTS message
+    size_t number_of_events_in_message =
+        find_events_in_message(events, number_of_events, &events_in_message);
+
     Reservation *reservations = NULL;
     size_t number_of_reservations = 0;
     size_t reservations_size = 0; // size of array [reservations]
@@ -580,7 +611,7 @@ int main(int argc, char *argv[]) {
     // reservations[index]. Tickets reserved by that reservation are:
     // first_tickets[index], first_tickets[index] + 1, first_tickets[index] + 2, ...
     // If first_tickets[index] = 0, tickets reserved by reservation
-    // reservations[index] have not been send yet.
+    // reservations[index] have not been sent yet.
     uint64_t *first_tickets = NULL;
     uint64_t next_ticket = MIN_TICKET_ID; // the lowest available ticket id
 
@@ -602,8 +633,9 @@ int main(int argc, char *argv[]) {
         switch (message_id) {
             case GET_EVENTS_ID:
                 if (read_length == 1) {
-                    size_t send_length = build_events_message(buffer, events, number_of_events);
-                    send_message(socket_fd, &client_address, buffer, send_length);
+                    size_t sent_length = build_events_message(buffer, events, events_in_message,
+                                                              number_of_events_in_message);
+                    send_message(socket_fd, &client_address, buffer, sent_length);
                 }
                 break;
             case GET_RESERVETION_ID:
@@ -639,9 +671,9 @@ int main(int argc, char *argv[]) {
                             next_ticket += ntohs(reservations[reservation_index].ticket_count);
                         }
 
-                        size_t send_length = build_tickets_message(buffer, &request,
+                        size_t sent_length = build_tickets_message(buffer, &request,
                             reservations, first_tickets[reservation_index]);
-                        send_message(socket_fd, &client_address, buffer, send_length);
+                        send_message(socket_fd, &client_address, buffer, sent_length);
                     }
                     else {
                         build_bad_request_message(buffer, request.reservation_id);
@@ -656,6 +688,7 @@ int main(int argc, char *argv[]) {
 
     free(file);
     free(events);
+    free(events_in_message);
     free(reservations);
     free(first_tickets);
 
