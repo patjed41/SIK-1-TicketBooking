@@ -6,6 +6,25 @@ My solution for the first project of the [Computer networks (pol. Sieci komputer
 
 Implement a UDP server that supports network booking of tickets for events. The server should be single-threaded and serve clients simultaneously.
 
+## Example of use
+
+Open two console.
+
+In the first console run the server:
+```
+./ticket_server -f events_example -p 2345 -t 10
+```
+In the second console run the client. Firstly, execute
+```
+./tickets_client
+```
+and read instruction that appears. If the client does not work, you can try with 'tickets_client_v2'. Then you can follow instruction, for example:
+```
+./ticket_client_vm_ver_1 localhost 2345 GET_EVENTS
+./ticket_client_v2 localhost 2345 GET_RESERVATION 1 10
+./ticket_client_v2 localhost 2345 GET_RESERVATION 1 100
+```
+
 ## Full description in polish
 
 ### Sieciowa rezerwacja biletów
@@ -76,11 +95,11 @@ Program nie może wysyłać komunikatów niezgodnych ze specyfikacją. Program n
 
 Plik `events_example` zawiera przykładowy opis wydarzeń.
 
-W celu ułatwienia testowania rozwiązań dostarczamy prostego klienta `ticket_client` w wersji binarnej skompilowanej na maszynie `students`. Przy czym nie gwarantujemy, że ten klient działa bezbłędnie.
+W celu ułatwienia testowania rozwiązań dostarczamy prostego klienta [ticket_client](https://github.com/patjed41/SIK-1-TicketBooking/blob/master/ticket_client) w wersji binarnej skompilowanej na maszynie `students`. Przy czym nie gwarantujemy, że ten klient działa bezbłędnie.
 
 ### Rozwiązanie
 
-Rozwiązanie należy zaimplementować w języku C lub C++, korzystając z interfejsu gniazd. Rozwiązanie powinno być zawarte w pliku o nazwie `ticket_server.c` lub `ticket_server.cpp`. Plik należy złożyć w Moodle przed upływem podanego terminu. Rozwiązanie będzie kompilowane na maszynie `students` poleceniem:
+Rozwiązanie należy zaimplementować w języku C lub C++, korzystając z interfejsu gniazd. Rozwiązanie powinno być zawarte w pliku o nazwie [ticket_server.c](https://github.com/patjed41/SIK-1-TicketBooking/blob/master/ticket_server.c) lub `ticket_server.cpp`. Plik należy złożyć w Moodle przed upływem podanego terminu. Rozwiązanie będzie kompilowane na maszynie `students` poleceniem:
 
 ```
 gcc -Wall -Wextra -Wno-implicit-fallthrough -std=c17 -O2
